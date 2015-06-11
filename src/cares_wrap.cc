@@ -20,6 +20,7 @@
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #define CARES_STATICLIB
+#define _WIN32_WINNT 0x0600
 #include "ares.h"
 #include "async-wrap.h"
 #include "async-wrap-inl.h"

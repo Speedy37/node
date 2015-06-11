@@ -67,14 +67,16 @@
 #include <string.h>
 #include <sys/types.h>
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) || defined(__MINGW32__)
 #include <direct.h>
 #include <io.h>
 #include <process.h>
+#if defined(_MSC_VER)
 #define strcasecmp _stricmp
 #define getpid _getpid
 #define umask _umask
 typedef int mode_t;
+#endif
 #else
 #include <sys/resource.h>  // getrlimit, setrlimit
 #include <unistd.h>  // setuid, getuid
@@ -2793,7 +2795,7 @@ static void SignalExit(int signo) {
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = SIG_DFL;
-  CHECK_EQ(sigaction(signo, &sa, NULL), 0);
+  CHECK_EQ(sigaction(signo, &sa, nullptr), 0);
 #endif
   raise(signo);
 }

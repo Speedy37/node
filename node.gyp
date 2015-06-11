@@ -314,7 +314,7 @@
             'PLATFORM="win32"',
             '_UNICODE=1',
           ],
-          'libraries': [ '-lpsapi.lib' ]
+          'libraries': [ '-lpsapi' ]
         }, { # POSIX
           'defines': [ '__POSIX__' ],
         }],
