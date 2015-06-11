@@ -1,441 +1,549 @@
--include config.mk
+# We borrow heavily from the kernel build setup, though we are simpler since
+# we don't have Kconfig tweaking settings on us.
 
+# The implicit make rules have it looking for RCS files, among other things.
+# We instead explicitly write all the rules we care about.
+# It's even quicker (saves ~200ms) to pass -r on the command line.
+MAKEFLAGS=-r
+
+# The source directory tree.
+srcdir := .
+abs_srcdir := $(abspath $(srcdir))
+
+# The name of the builddir.
+builddir_name ?= out
+
+# The V=1 flag on command line makes us verbosely print command lines.
+ifdef V
+  quiet=
+else
+  quiet=quiet_
+endif
+
+# Specify BUILDTYPE=Release on the command line for a release build.
 BUILDTYPE ?= Release
-PYTHON ?= python
-NINJA ?= ninja
-DESTDIR ?=
-SIGN ?=
-PREFIX ?= /usr/local
 
-NODE ?= ./node
+# Directory all our build output goes into.
+# Note that this must be two directories beneath src/ for unit tests to pass,
+# as they reach into the src/ directory for data with relative paths.
+builddir ?= $(builddir_name)/$(BUILDTYPE)
+abs_builddir := $(abspath $(builddir))
+depsdir := $(builddir)/.deps
 
-# Default to verbose builds.
-# To do quiet/pretty builds, run `make V=` to set V to an empty string,
-# or set the V environment variable to an empty string.
-V ?= 1
+# Object output directory.
+obj := $(builddir)/obj
+abs_obj := $(abspath $(obj))
 
-ifeq ($(USE_NINJA),1)
-ifneq ($(V),)
-NINJA := $(NINJA) -v
+# We build up a list of every single one of the targets so we can slurp in the
+# generated dependency rule Makefiles in one pass.
+all_deps :=
+
+
+
+CC.target ?= gcc
+CFLAGS.target ?= $(CFLAGS)
+CXX.target ?= g++
+CXXFLAGS.target ?= $(CXXFLAGS)
+LINK.target ?= g++
+LDFLAGS.target ?= $(LDFLAGS)
+AR.target ?= $(AR)
+
+# C++ apps need to be linked with g++.
+#
+# Note: flock is used to seralize linking. Linking is a memory-intensive
+# process so running parallel links can often lead to thrashing.  To disable
+# the serialization, override LINK via an envrionment variable as follows:
+#
+#   export LINK=g++
+#
+# This will allow make to invoke N linker processes as specified in -jN.
+LINK ?= flock $(builddir)/linker.lock $(CXX.target)
+
+# TODO(evan): move all cross-compilation logic to gyp-time so we don't need
+# to replicate this environment fallback in make as well.
+CC.host ?= gcc
+CFLAGS.host ?=
+CXX.host ?= g++
+CXXFLAGS.host ?=
+LINK.host ?= $(CXX.host)
+LDFLAGS.host ?=
+AR.host ?= ar
+
+# Define a dir function that can handle spaces.
+# http://www.gnu.org/software/make/manual/make.html#Syntax-of-Functions
+# "leading spaces cannot appear in the text of the first argument as written.
+# These characters can be put into the argument value by variable substitution."
+empty :=
+space := $(empty) $(empty)
+
+# http://stackoverflow.com/questions/1189781/using-make-dir-or-notdir-on-a-path-with-spaces
+replace_spaces = $(subst $(space),?,$1)
+unreplace_spaces = $(subst ?,$(space),$1)
+dirx = $(call unreplace_spaces,$(dir $(call replace_spaces,$1)))
+
+# Flags to make gcc output dependency info.  Note that you need to be
+# careful here to use the flags that ccache and distcc can understand.
+# We write to a dep file on the side first and then rename at the end
+# so we can't end up with a broken dep file.
+depfile = $(depsdir)/$(call replace_spaces,$@).d
+DEPFLAGS = -MMD -MF $(depfile).raw
+
+# We have to fixup the deps output in a few ways.
+# (1) the file output should mention the proper .o file.
+# ccache or distcc lose the path to the target, so we convert a rule of
+# the form:
+#   foobar.o: DEP1 DEP2
+# into
+#   path/to/foobar.o: DEP1 DEP2
+# (2) we want missing files not to cause us to fail to build.
+# We want to rewrite
+#   foobar.o: DEP1 DEP2 \
+#               DEP3
+# to
+#   DEP1:
+#   DEP2:
+#   DEP3:
+# so if the files are missing, they're just considered phony rules.
+# We have to do some pretty insane escaping to get those backslashes
+# and dollar signs past make, the shell, and sed at the same time.
+# Doesn't work with spaces, but that's fine: .d files have spaces in
+# their names replaced with other characters.
+define fixup_dep
+# The depfile may not exist if the input file didn't have any #includes.
+touch $(depfile).raw
+# Fixup path as in (1).
+sed -e "s|^$(notdir $@)|$@|" $(depfile).raw >> $(depfile)
+# Add extra rules as in (2).
+# We remove slashes and replace spaces with new lines;
+# remove blank lines;
+# delete the first line and append a colon to the remaining lines.
+sed -e 's|\\||' -e 'y| |\n|' $(depfile).raw |\
+  grep -v '^$$'                             |\
+  sed -e 1d -e 's|$$|:|'                     \
+    >> $(depfile)
+rm $(depfile).raw
+endef
+
+# Command definitions:
+# - cmd_foo is the actual command to run;
+# - quiet_cmd_foo is the brief-output summary of the command.
+
+quiet_cmd_cc = CC($(TOOLSET)) $@
+cmd_cc = $(CC.$(TOOLSET)) $(GYP_CFLAGS) $(DEPFLAGS) $(CFLAGS.$(TOOLSET)) -c -o $@ $<
+
+quiet_cmd_cxx = CXX($(TOOLSET)) $@
+cmd_cxx = $(CXX.$(TOOLSET)) $(GYP_CXXFLAGS) $(DEPFLAGS) $(CXXFLAGS.$(TOOLSET)) -c -o $@ $<
+
+quiet_cmd_touch = TOUCH $@
+cmd_touch = touch $@
+
+quiet_cmd_copy = COPY $@
+# send stderr to /dev/null to ignore messages when linking directories.
+cmd_copy = ln -f "$<" "$@" 2>/dev/null || (rm -rf "$@" && cp -af "$<" "$@")
+
+quiet_cmd_alink = AR($(TOOLSET)) $@
+cmd_alink = rm -f $@ && $(AR.$(TOOLSET)) crs $@ $(filter %.o,$^)
+
+quiet_cmd_alink_thin = AR($(TOOLSET)) $@
+cmd_alink_thin = rm -f $@ && $(AR.$(TOOLSET)) crsT $@ $(filter %.o,$^)
+
+# Due to circular dependencies between libraries :(, we wrap the
+# special "figure out circular dependencies" flags around the entire
+# input list during linking.
+quiet_cmd_link = LINK($(TOOLSET)) $@
+cmd_link = $(LINK.$(TOOLSET)) $(GYP_LDFLAGS) $(LDFLAGS.$(TOOLSET)) -o $@ -Wl,--start-group $(LD_INPUTS) -Wl,--end-group $(LIBS)
+
+# We support two kinds of shared objects (.so):
+# 1) shared_library, which is just bundling together many dependent libraries
+# into a link line.
+# 2) loadable_module, which is generating a module intended for dlopen().
+#
+# They differ only slightly:
+# In the former case, we want to package all dependent code into the .so.
+# In the latter case, we want to package just the API exposed by the
+# outermost module.
+# This means shared_library uses --whole-archive, while loadable_module doesn't.
+# (Note that --whole-archive is incompatible with the --start-group used in
+# normal linking.)
+
+# Other shared-object link notes:
+# - Set SONAME to the library filename so our binaries don't reference
+# the local, absolute paths used on the link command-line.
+quiet_cmd_solink = SOLINK($(TOOLSET)) $@
+cmd_solink = $(LINK.$(TOOLSET)) -shared $(GYP_LDFLAGS) $(LDFLAGS.$(TOOLSET)) -Wl,-soname=$(@F) -o $@ -Wl,--whole-archive $(LD_INPUTS) -Wl,--no-whole-archive $(LIBS)
+
+quiet_cmd_solink_module = SOLINK_MODULE($(TOOLSET)) $@
+cmd_solink_module = $(LINK.$(TOOLSET)) -shared $(GYP_LDFLAGS) $(LDFLAGS.$(TOOLSET)) -Wl,-soname=$(@F) -o $@ -Wl,--start-group $(filter-out FORCE_DO_CMD, $^) -Wl,--end-group $(LIBS)
+
+
+# Define an escape_quotes function to escape single quotes.
+# This allows us to handle quotes properly as long as we always use
+# use single quotes and escape_quotes.
+escape_quotes = $(subst ','\'',$(1))
+# This comment is here just to include a ' to unconfuse syntax highlighting.
+# Define an escape_vars function to escape '$' variable syntax.
+# This allows us to read/write command lines with shell variables (e.g.
+# $LD_LIBRARY_PATH), without triggering make substitution.
+escape_vars = $(subst $$,$$$$,$(1))
+# Helper that expands to a shell command to echo a string exactly as it is in
+# make. This uses printf instead of echo because printf's behaviour with respect
+# to escape sequences is more portable than echo's across different shells
+# (e.g., dash, bash).
+exact_echo = printf '%s\n' '$(call escape_quotes,$(1))'
+
+# Helper to compare the command we're about to run against the command
+# we logged the last time we ran the command.  Produces an empty
+# string (false) when the commands match.
+# Tricky point: Make has no string-equality test function.
+# The kernel uses the following, but it seems like it would have false
+# positives, where one string reordered its arguments.
+#   arg_check = $(strip $(filter-out $(cmd_$(1)), $(cmd_$@)) \
+#                       $(filter-out $(cmd_$@), $(cmd_$(1))))
+# We instead substitute each for the empty string into the other, and
+# say they're equal if both substitutions produce the empty string.
+# .d files contain ? instead of spaces, take that into account.
+command_changed = $(or $(subst $(cmd_$(1)),,$(cmd_$(call replace_spaces,$@))),\
+                       $(subst $(cmd_$(call replace_spaces,$@)),,$(cmd_$(1))))
+
+# Helper that is non-empty when a prerequisite changes.
+# Normally make does this implicitly, but we force rules to always run
+# so we can check their command lines.
+#   $? -- new prerequisites
+#   $| -- order-only dependencies
+prereq_changed = $(filter-out FORCE_DO_CMD,$(filter-out $|,$?))
+
+# Helper that executes all postbuilds until one fails.
+define do_postbuilds
+  @E=0;\
+  for p in $(POSTBUILDS); do\
+    eval $$p;\
+    E=$$?;\
+    if [ $$E -ne 0 ]; then\
+      break;\
+    fi;\
+  done;\
+  if [ $$E -ne 0 ]; then\
+    rm -rf "$@";\
+    exit $$E;\
+  fi
+endef
+
+# do_cmd: run a command via the above cmd_foo names, if necessary.
+# Should always run for a given target to handle command-line changes.
+# Second argument, if non-zero, makes it do asm/C/C++ dependency munging.
+# Third argument, if non-zero, makes it do POSTBUILDS processing.
+# Note: We intentionally do NOT call dirx for depfile, since it contains ? for
+# spaces already and dirx strips the ? characters.
+define do_cmd
+$(if $(or $(command_changed),$(prereq_changed)),
+  @$(call exact_echo,  $($(quiet)cmd_$(1)))
+  @mkdir -p "$(call dirx,$@)" "$(dir $(depfile))"
+  $(if $(findstring flock,$(word 1,$(cmd_$1))),
+    @$(cmd_$(1))
+    @echo "  $(quiet_cmd_$(1)): Finished",
+    @$(cmd_$(1))
+  )
+  @$(call exact_echo,$(call escape_vars,cmd_$(call replace_spaces,$@) := $(cmd_$(1)))) > $(depfile)
+  @$(if $(2),$(fixup_dep))
+  $(if $(and $(3), $(POSTBUILDS)),
+    $(call do_postbuilds)
+  )
+)
+endef
+
+# Declare the "all" target first so it is the default,
+# even though we don't have the deps yet.
+.PHONY: all
+all:
+
+# make looks for ways to re-generate included makefiles, but in our case, we
+# don't have a direct way. Explicitly telling make that it has nothing to do
+# for them makes it go faster.
+%.d: ;
+
+# Use FORCE_DO_CMD to force a target to run.  Should be coupled with
+# do_cmd.
+.PHONY: FORCE_DO_CMD
+FORCE_DO_CMD:
+
+TOOLSET := host
+# Suffix rules, putting all outputs into $(obj).
+$(obj).$(TOOLSET)/%.o: $(srcdir)/%.c FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+$(obj).$(TOOLSET)/%.o: $(srcdir)/%.cc FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(srcdir)/%.cpp FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(srcdir)/%.cxx FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(srcdir)/%.S FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+$(obj).$(TOOLSET)/%.o: $(srcdir)/%.s FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+
+# Try building from generated source, too.
+$(obj).$(TOOLSET)/%.o: $(obj).$(TOOLSET)/%.c FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+$(obj).$(TOOLSET)/%.o: $(obj).$(TOOLSET)/%.cc FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(obj).$(TOOLSET)/%.cpp FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(obj).$(TOOLSET)/%.cxx FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(obj).$(TOOLSET)/%.S FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+$(obj).$(TOOLSET)/%.o: $(obj).$(TOOLSET)/%.s FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+
+$(obj).$(TOOLSET)/%.o: $(obj)/%.c FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+$(obj).$(TOOLSET)/%.o: $(obj)/%.cc FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(obj)/%.cpp FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(obj)/%.cxx FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(obj)/%.S FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+$(obj).$(TOOLSET)/%.o: $(obj)/%.s FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+
+TOOLSET := target
+# Suffix rules, putting all outputs into $(obj).
+$(obj).$(TOOLSET)/%.o: $(srcdir)/%.c FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+$(obj).$(TOOLSET)/%.o: $(srcdir)/%.cc FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(srcdir)/%.cpp FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(srcdir)/%.cxx FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(srcdir)/%.S FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+$(obj).$(TOOLSET)/%.o: $(srcdir)/%.s FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+
+# Try building from generated source, too.
+$(obj).$(TOOLSET)/%.o: $(obj).$(TOOLSET)/%.c FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+$(obj).$(TOOLSET)/%.o: $(obj).$(TOOLSET)/%.cc FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(obj).$(TOOLSET)/%.cpp FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(obj).$(TOOLSET)/%.cxx FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(obj).$(TOOLSET)/%.S FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+$(obj).$(TOOLSET)/%.o: $(obj).$(TOOLSET)/%.s FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+
+$(obj).$(TOOLSET)/%.o: $(obj)/%.c FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+$(obj).$(TOOLSET)/%.o: $(obj)/%.cc FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(obj)/%.cpp FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(obj)/%.cxx FORCE_DO_CMD
+	@$(call do_cmd,cxx,1)
+$(obj).$(TOOLSET)/%.o: $(obj)/%.S FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+$(obj).$(TOOLSET)/%.o: $(obj)/%.s FORCE_DO_CMD
+	@$(call do_cmd,cc,1)
+
+
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/cares/cares.target.mk)))),)
+  include deps/cares/cares.target.mk
 endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/debugger-agent/debugger-agent.target.mk)))),)
+  include deps/debugger-agent/debugger-agent.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/http_parser/http_parser.target.mk)))),)
+  include deps/http_parser/http_parser.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/http_parser/http_parser_strict.target.mk)))),)
+  include deps/http_parser/http_parser_strict.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/http_parser/test-nonstrict.target.mk)))),)
+  include deps/http_parser/test-nonstrict.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/http_parser/test-strict.target.mk)))),)
+  include deps/http_parser/test-strict.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/uv/libuv.target.mk)))),)
+  include deps/uv/libuv.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/uv/run-benchmarks.target.mk)))),)
+  include deps/uv/run-benchmarks.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/uv/run-tests.target.mk)))),)
+  include deps/uv/run-tests.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/js2c.host.mk)))),)
+  include deps/v8/tools/gyp/js2c.host.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/mksnapshot.host.mk)))),)
+  include deps/v8/tools/gyp/mksnapshot.host.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/natives_blob.host.mk)))),)
+  include deps/v8/tools/gyp/natives_blob.host.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/postmortem-metadata.target.mk)))),)
+  include deps/v8/tools/gyp/postmortem-metadata.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8.host.mk)))),)
+  include deps/v8/tools/gyp/v8.host.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8.target.mk)))),)
+  include deps/v8/tools/gyp/v8.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8_base.host.mk)))),)
+  include deps/v8/tools/gyp/v8_base.host.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8_base.target.mk)))),)
+  include deps/v8/tools/gyp/v8_base.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8_external_snapshot.host.mk)))),)
+  include deps/v8/tools/gyp/v8_external_snapshot.host.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8_libbase.host.mk)))),)
+  include deps/v8/tools/gyp/v8_libbase.host.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8_libbase.target.mk)))),)
+  include deps/v8/tools/gyp/v8_libbase.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8_libplatform.host.mk)))),)
+  include deps/v8/tools/gyp/v8_libplatform.host.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8_libplatform.target.mk)))),)
+  include deps/v8/tools/gyp/v8_libplatform.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8_nosnapshot.host.mk)))),)
+  include deps/v8/tools/gyp/v8_nosnapshot.host.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8_nosnapshot.target.mk)))),)
+  include deps/v8/tools/gyp/v8_nosnapshot.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8_snapshot.host.mk)))),)
+  include deps/v8/tools/gyp/v8_snapshot.host.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/v8/tools/gyp/v8_snapshot.target.mk)))),)
+  include deps/v8/tools/gyp/v8_snapshot.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,deps/zlib/zlib.target.mk)))),)
+  include deps/zlib/zlib.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,node.target.mk)))),)
+  include node.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,node_dtrace_header.target.mk)))),)
+  include node_dtrace_header.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,node_dtrace_provider.target.mk)))),)
+  include node_dtrace_provider.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,node_dtrace_ustack.target.mk)))),)
+  include node_dtrace_ustack.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,node_etw.target.mk)))),)
+  include node_etw.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,node_js2c.host.mk)))),)
+  include node_js2c.host.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,node_mdb.target.mk)))),)
+  include node_mdb.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,node_perfctr.target.mk)))),)
+  include node_perfctr.target.mk
+endif
+ifeq ($(strip $(foreach prefix,$(NO_LOAD),\
+    $(findstring $(join ^,$(prefix)),\
+                 $(join ^,specialize_node_d.target.mk)))),)
+  include specialize_node_d.target.mk
 endif
 
-# BUILDTYPE=Debug builds both release and debug builds. If you want to compile
-# just the debug build, run `make -C out BUILDTYPE=Debug` instead.
-ifeq ($(BUILDTYPE),Release)
-all: out/Makefile node
-else
-all: out/Makefile node node_g
+quiet_cmd_regen_makefile = ACTION Regenerating $@
+cmd_regen_makefile = cd $(srcdir); ./tools/gyp_node.py -fmake --ignore-environment "--toplevel-dir=." -Icommon.gypi -Iconfig.gypi -Icommon.gypi -Iconfig.gypi -Icommon.gypi -Iconfig.gypi -Icommon.gypi -Iconfig.gypi -Icommon.gypi -Iconfig.gypi -Icommon.gypi -Iconfig.gypi -Icommon.gypi -Iconfig.gypi -Icommon.gypi -Iconfig.gypi -Icommon.gypi -Iconfig.gypi -Icommon.gypi -Iconfig.gypi -Icommon.gypi -Iconfig.gypi -Icommon.gypi -Iconfig.gypi "--depth=." "-Dcomponent=static_library" "-Dlibrary=static_library" "-Dcomponent=static_library" "-Dlibrary=static_library" "-Dcomponent=static_library" "-Dlibrary=static_library" "-Dcomponent=static_library" "-Dlibrary=static_library" "-Dcomponent=static_library" "-Dlibrary=static_library" "-Dcomponent=static_library" "-Dlibrary=static_library" "-Dcomponent=static_library" "-Dlibrary=static_library" "-Dcomponent=static_library" "-Dlibrary=static_library" "-Dcomponent=static_library" "-Dlibrary=static_library" "-Dcomponent=static_library" "-Dlibrary=static_library" "-Dcomponent=static_library" "-Dlibrary=static_library" "-Dcomponent=static_library" "-Dlibrary=static_library" node.gyp node.gyp node.gyp node.gyp node.gyp node.gyp node.gyp node.gyp node.gyp node.gyp node.gyp node.gyp
+Makefile: deps/cares/cares.gyp common.gypi deps/debugger-agent/debugger-agent.gyp deps/uv/uv.gyp deps/http_parser/http_parser.gyp deps/zlib/zlib.gyp deps/v8/tools/gyp/v8.gyp node.gyp deps/v8/build/features.gypi deps/v8/build/toolchain.gypi config.gypi
+	$(call do_cmd,regen_makefile)
+
+# "all" is a concatenation of the "all" targets from all the included
+# sub-makefiles. This is just here to clarify.
+all:
+
+# Add in dependency-tracking rules.  $(all_deps) is the list of every single
+# target in our tree. Only consider the ones with .d (dependency) info:
+d_files := $(wildcard $(foreach f,$(all_deps),$(depsdir)/$(f).d))
+ifneq ($(d_files),)
+  include $(d_files)
 endif
-
-# The .PHONY is needed to ensure that we recursively use the out/Makefile
-# to check for changes.
-.PHONY: node node_g
-
-ifeq ($(USE_NINJA),1)
-node: config.gypi
-	$(NINJA) -C out/Release/
-	ln -fs out/Release/node node
-
-node_g: config.gypi
-	$(NINJA) -C out/Debug/
-	ln -fs out/Debug/node $@
-else
-node: config.gypi out/Makefile
-	$(MAKE) -C out BUILDTYPE=Release V=$(V)
-	ln -fs out/Release/node node
-
-node_g: config.gypi out/Makefile
-	$(MAKE) -C out BUILDTYPE=Debug V=$(V)
-	ln -fs out/Debug/node $@
-endif
-
-out/Makefile: common.gypi deps/uv/uv.gyp deps/http_parser/http_parser.gyp deps/zlib/zlib.gyp deps/v8/build/toolchain.gypi deps/v8/build/features.gypi deps/v8/tools/gyp/v8.gyp node.gyp config.gypi
-ifeq ($(USE_NINJA),1)
-	touch out/Makefile
-	$(PYTHON) tools/gyp_node.py -f ninja
-else
-	$(PYTHON) tools/gyp_node.py -f make
-endif
-
-config.gypi: configure
-	if [ -f $@ ]; then
-		$(error Stale $@, please re-run ./configure)
-	else
-		$(error No $@, please run ./configure first)
-	fi
-
-install: all
-	$(PYTHON) tools/install.py $@ '$(DESTDIR)' '$(PREFIX)'
-
-uninstall:
-	$(PYTHON) tools/install.py $@ '$(DESTDIR)' '$(PREFIX)'
-
-clean:
-	-rm -rf out/Makefile node node_g out/$(BUILDTYPE)/node blog.html email.md
-	-find out/ -name '*.o' -o -name '*.a' | xargs rm -rf
-	-rm -rf node_modules
-
-distclean:
-	-rm -rf out
-	-rm -f config.gypi icu_config.gypi
-	-rm -f config.mk
-	-rm -rf node node_g blog.html email.md
-	-rm -rf node_modules
-	-rm -rf deps/icu
-	-rm -rf deps/icu4c*.tgz deps/icu4c*.zip deps/icu-tmp
-
-test: all
-	$(PYTHON) tools/test.py --mode=release simple message
-	$(MAKE) jslint
-	$(MAKE) cpplint
-
-test-http1: all
-	$(PYTHON) tools/test.py --mode=release --use-http1 simple message
-
-test-valgrind: all
-	$(PYTHON) tools/test.py --mode=release --valgrind simple message
-
-test/gc/node_modules/weak/build/Release/weakref.node:
-	@if [ ! -f node ]; then make all; fi
-	./node deps/npm/node_modules/node-gyp/bin/node-gyp rebuild \
-		--directory="$(shell pwd)/test/gc/node_modules/weak" \
-		--nodedir="$(shell pwd)"
-
-build-addons:
-	@if [ ! -f node ]; then make all; fi
-	rm -rf test/addons/doc-*/
-	./node tools/doc/addon-verify.js
-	$(foreach dir, \
-			$(sort $(dir $(wildcard test/addons/*/*.gyp))), \
-			./node deps/npm/node_modules/node-gyp/bin/node-gyp rebuild \
-					--directory="$(shell pwd)/$(dir)" \
-					--nodedir="$(shell pwd)" && ) echo "build done"
-
-test-gc: all test/gc/node_modules/weak/build/Release/weakref.node
-	$(PYTHON) tools/test.py --mode=release gc
-
-test-build: all build-addons
-
-test-all: test-build test/gc/node_modules/weak/build/Release/weakref.node
-	$(PYTHON) tools/test.py --mode=debug,release
-	make test-npm
-
-test-all-http1: test-build
-	$(PYTHON) tools/test.py --mode=debug,release --use-http1
-
-test-all-valgrind: test-build
-	$(PYTHON) tools/test.py --mode=debug,release --valgrind
-
-test-release: test-build
-	$(PYTHON) tools/test.py --mode=release
-
-test-debug: test-build
-	$(PYTHON) tools/test.py --mode=debug
-
-test-message: test-build
-	$(PYTHON) tools/test.py message
-
-test-simple: all
-	$(PYTHON) tools/test.py simple
-
-test-pummel: all wrk
-	$(PYTHON) tools/test.py pummel
-
-test-internet: all
-	$(PYTHON) tools/test.py internet
-
-test-debugger: all
-	$(PYTHON) tools/test.py debugger
-
-test-npm: node
-	rm -rf npm-cache npm-tmp npm-prefix
-	mkdir npm-cache npm-tmp npm-prefix
-	cd deps/npm ; npm_config_cache="$(shell pwd)/npm-cache" \
-	     npm_config_prefix="$(shell pwd)/npm-prefix" \
-	     npm_config_tmp="$(shell pwd)/npm-tmp" \
-	     PATH="../../:${PATH}" node cli.js install
-	cd deps/npm ; npm_config_cache="$(shell pwd)/npm-cache" \
-	     npm_config_prefix="$(shell pwd)/npm-prefix" \
-	     npm_config_tmp="$(shell pwd)/npm-tmp" \
-	     PATH="../../:${PATH}" node cli.js run-script test-all && \
-	     PATH="../../:${PATH}" node cli.js prune --prod && \
-	     cd ../.. && \
-	     rm -rf npm-cache npm-tmp npm-prefix
-
-test-npm-publish: node
-	npm_package_config_publishtest=true ./node deps/npm/test/run.js
-
-test-addons: test-build
-	$(PYTHON) tools/test.py --mode=release addons
-
-test-timers:
-	$(MAKE) --directory=tools faketime
-	$(PYTHON) tools/test.py --mode=release timers
-
-test-timers-clean:
-	$(MAKE) --directory=tools clean
-
-apidoc_sources = $(wildcard doc/api/*.markdown)
-apidocs = $(addprefix out/,$(apidoc_sources:.markdown=.html)) \
-          $(addprefix out/,$(apidoc_sources:.markdown=.json))
-
-apidoc_dirs = out/doc out/doc/api/ out/doc/api/assets
-
-apiassets = $(subst api_assets,api/assets,$(addprefix out/,$(wildcard doc/api_assets/*)))
-
-website_files = \
-	out/doc/sh_main.js    \
-	out/doc/sh_javascript.min.js
-
-doc: $(apidoc_dirs) $(website_files) $(apiassets) $(apidocs) tools/doc/ out/doc/changelog.html node
-
-doc-branch: NODE_DOC_VERSION = v$(shell $(PYTHON) tools/getnodeversion.py | cut -f1,2 -d.)
-doc-branch: doc
-
-$(apidoc_dirs):
-	mkdir -p $@
-
-out/doc/api/assets/%: doc/api_assets/% out/doc/api/assets/
-	cp $< $@
-
-out/doc/changelog.html: ChangeLog doc/changelog-head.html doc/changelog-foot.html tools/build-changelog.sh node
-	bash tools/build-changelog.sh
-
-out/doc/%: doc/%
-	cp -r $< $@
-
-out/doc/api/%.json: doc/api/%.markdown node
-	NODE_DOC_VERSION=$(NODE_DOC_VERSION) out/Release/node tools/doc/generate.js --format=json $< > $@
-
-out/doc/api/%.html: doc/api/%.markdown node
-	NODE_DOC_VERSION=$(NODE_DOC_VERSION) out/Release/node tools/doc/generate.js --format=html --template=doc/template.html $< > $@
-
-email.md: ChangeLog tools/email-footer.md
-	bash tools/changelog-head.sh | sed 's|^\* #|* \\#|g' > $@
-	cat tools/email-footer.md | sed -e 's|__VERSION__|'$(VERSION)'|g' >> $@
-
-blog.html: email.md
-	cat $< | ./node tools/doc/node_modules/.bin/marked > $@
-
-website-upload: doc
-	rsync -r out/doc/ node@nodejs.org:~/web/nodejs.org/
-	ssh node@nodejs.org '\
-    rm -f ~/web/nodejs.org/dist/latest &&\
-    ln -s $(VERSION) ~/web/nodejs.org/dist/latest &&\
-    rm -f ~/web/nodejs.org/docs/latest &&\
-    ln -s $(VERSION) ~/web/nodejs.org/docs/latest &&\
-    rm -f ~/web/nodejs.org/dist/node-latest.tar.gz &&\
-    ln -s $(VERSION)/node-$(VERSION).tar.gz ~/web/nodejs.org/dist/node-latest.tar.gz'
-
-doc-branch-upload: NODE_DOC_VERSION = v$(shell $(PYTHON) tools/getnodeversion.py | cut -f1,2 -d.)
-doc-branch-upload: doc-branch
-	echo $(NODE_DOC_VERSION)
-	rsync -r out/doc/api/ node@nodejs.org:~/web/nodejs.org/$(NODE_DOC_VERSION)
-
-docopen: out/doc/api/all.html
-	-google-chrome out/doc/api/all.html
-
-docclean:
-	-rm -rf out/doc
-
-RAWVER=$(shell $(PYTHON) tools/getnodeversion.py)
-VERSION=v$(RAWVER)
-NODE_DOC_VERSION=$(VERSION)
-RELEASE=$(shell $(PYTHON) tools/getnodeisrelease.py)
-PLATFORM=$(shell uname | tr '[:upper:]' '[:lower:]')
-ifeq ($(findstring x86_64,$(shell uname -m)),x86_64)
-DESTCPU ?= x64
-else
-DESTCPU ?= ia32
-endif
-ifeq ($(DESTCPU),x64)
-ARCH=x64
-else
-ifeq ($(DESTCPU),arm)
-ARCH=arm
-else
-ARCH=x86
-endif
-endif
-TARNAME=node-$(VERSION)
-ifdef NIGHTLY
-TAG = nightly-$(NIGHTLY)
-TARNAME=node-$(VERSION)-$(TAG)
-endif
-TARBALL=$(TARNAME).tar.gz
-BINARYNAME=$(TARNAME)-$(PLATFORM)-$(ARCH)
-BINARYTAR=$(BINARYNAME).tar.gz
-PKG=out/$(TARNAME).pkg
-PACKAGEMAKER ?= /Developer/Applications/Utilities/PackageMaker.app/Contents/MacOS/PackageMaker
-
-PKGSRC=nodejs-$(DESTCPU)-$(RAWVER).tgz
-ifdef NIGHTLY
-PKGSRC=nodejs-$(DESTCPU)-$(RAWVER)-$(TAG).tgz
-endif
-
-dist: doc $(TARBALL) $(PKG)
-
-PKGDIR=out/dist-osx
-
-release-only:
-	@if [ "$(shell git status --porcelain | egrep -v '^\?\? ')" = "" ]; then \
-		exit 0 ; \
-	else \
-	  echo "" >&2 ; \
-		echo "The git repository is not clean." >&2 ; \
-		echo "Please commit changes before building release tarball." >&2 ; \
-		echo "" >&2 ; \
-		git status --porcelain | egrep -v '^\?\?' >&2 ; \
-		echo "" >&2 ; \
-		exit 1 ; \
-	fi
-	@if [ "$(NIGHTLY)" != "" -o "$(RELEASE)" = "1" ]; then \
-		exit 0; \
-	else \
-	  echo "" >&2 ; \
-		echo "#NODE_VERSION_IS_RELEASE is set to $(RELEASE)." >&2 ; \
-	  echo "Did you remember to update src/node_version.cc?" >&2 ; \
-	  echo "" >&2 ; \
-		exit 1 ; \
-	fi
-
-pkg: $(PKG)
-
-$(PKG): release-only
-	rm -rf $(PKGDIR)
-	rm -rf out/deps out/Release
-	$(PYTHON) ./configure --download=all --with-intl=small-icu \
-		--without-snapshot --dest-cpu=ia32 --tag=$(TAG)
-	$(MAKE) install V=$(V) DESTDIR=$(PKGDIR)/32
-	rm -rf out/deps out/Release
-	$(PYTHON) ./configure --download=all --with-intl=small-icu \
-		--without-snapshot --dest-cpu=x64 --tag=$(TAG)
-	$(MAKE) install V=$(V) DESTDIR=$(PKGDIR)
-	SIGN="$(APP_SIGN)" PKGDIR="$(PKGDIR)" bash tools/osx-codesign.sh
-	lipo $(PKGDIR)/32/usr/local/bin/node \
-		$(PKGDIR)/usr/local/bin/node \
-		-output $(PKGDIR)/usr/local/bin/node-universal \
-		-create
-	mv $(PKGDIR)/usr/local/bin/node-universal $(PKGDIR)/usr/local/bin/node
-	rm -rf $(PKGDIR)/32
-	$(PACKAGEMAKER) \
-		--id "org.nodejs.Node" \
-		--doc tools/osx-pkg.pmdoc \
-		--out $(PKG)
-	SIGN="$(INT_SIGN)" PKG="$(PKG)" bash tools/osx-productsign.sh
-
-$(TARBALL): release-only node doc
-	git archive --format=tar --prefix=$(TARNAME)/ HEAD | tar xf -
-	mkdir -p $(TARNAME)/doc/api
-	cp doc/node.1 $(TARNAME)/doc/node.1
-	cp -r out/doc/api/* $(TARNAME)/doc/api/
-	rm -rf $(TARNAME)/deps/v8/test # too big
-	rm -rf $(TARNAME)/doc/images # too big
-	find $(TARNAME)/ -type l | xargs rm # annoying on windows
-	tar -cf $(TARNAME).tar $(TARNAME)
-	rm -rf $(TARNAME)
-	gzip -f -9 $(TARNAME).tar
-
-tar: $(TARBALL)
-
-$(BINARYTAR): release-only
-	rm -rf $(BINARYNAME)
-	rm -rf out/deps out/Release
-	$(PYTHON) ./configure --prefix=/ --download=all --with-intl=small-icu \
-		--without-snapshot --dest-cpu=$(DESTCPU) --tag=$(TAG) $(CONFIG_FLAGS)
-	$(MAKE) install DESTDIR=$(BINARYNAME) V=$(V) PORTABLE=1
-	cp README.md $(BINARYNAME)
-	cp LICENSE $(BINARYNAME)
-	cp ChangeLog $(BINARYNAME)
-	tar -cf $(BINARYNAME).tar $(BINARYNAME)
-	rm -rf $(BINARYNAME)
-	gzip -f -9 $(BINARYNAME).tar
-
-binary: $(BINARYTAR)
-
-$(PKGSRC): release-only
-	rm -rf dist out
-	$(PYTHON) configure --prefix=/ --without-snapshot --download=all \
-		--with-intl=small-icu --dest-cpu=$(DESTCPU) --tag=$(TAG) \
-		$(CONFIG_FLAGS)
-	$(MAKE) install DESTDIR=dist
-	(cd dist; find * -type f | sort) > packlist
-	pkg_info -X pkg_install | \
-		egrep '^(MACHINE_ARCH|OPSYS|OS_VERSION|PKGTOOLS_VERSION)' > build-info
-	pkg_create -B build-info -c tools/pkgsrc/comment -d tools/pkgsrc/description \
-		-f packlist -I /opt/local -p dist -U $(PKGSRC)
-
-pkgsrc: $(PKGSRC)
-
-dist-upload: $(TARBALL) $(PKG)
-	ssh node@nodejs.org mkdir -p web/nodejs.org/dist/$(VERSION)
-	scp $(TARBALL) node@nodejs.org:~/web/nodejs.org/dist/$(VERSION)/$(TARBALL)
-	scp $(PKG) node@nodejs.org:~/web/nodejs.org/dist/$(VERSION)/$(TARNAME).pkg
-
-wrkclean:
-	$(MAKE) -C tools/wrk/ clean
-	rm tools/wrk/wrk
-
-wrk: tools/wrk/wrk
-tools/wrk/wrk:
-	$(MAKE) -C tools/wrk/
-
-bench-net: all
-	@$(NODE) benchmark/common.js net
-
-bench-crypto: all
-	@$(NODE) benchmark/common.js crypto
-
-bench-tls: all
-	@$(NODE) benchmark/common.js tls
-
-bench-http: wrk all
-	@$(NODE) benchmark/common.js http
-
-bench-fs: all
-	@$(NODE) benchmark/common.js fs
-
-bench-misc: all
-	@$(MAKE) -C benchmark/misc/function_call/
-	@$(NODE) benchmark/common.js misc
-
-bench-array: all
-	@$(NODE) benchmark/common.js arrays
-
-bench-buffer: all
-	@$(NODE) benchmark/common.js buffers
-
-bench-all: bench bench-misc bench-array bench-buffer
-
-bench: bench-net bench-http bench-fs bench-tls
-
-bench-http-simple:
-	 benchmark/http_simple_bench.sh
-
-bench-idle:
-	./node benchmark/idle_server.js &
-	sleep 1
-	./node benchmark/idle_clients.js &
-
-jslintfix:
-	PYTHONPATH=tools/closure_linter/ $(PYTHON) tools/closure_linter/closure_linter/fixjsstyle.py --strict --nojsdoc -r lib/ -r src/ --exclude_files lib/punycode.js
-
-jslint:
-	PYTHONPATH=tools/closure_linter/ $(PYTHON) tools/closure_linter/closure_linter/gjslint.py --unix_mode --strict --nojsdoc -r lib/ -r src/ --exclude_files lib/punycode.js
-
-CPPLINT_EXCLUDE ?=
-CPPLINT_EXCLUDE += src/node_root_certs.h
-CPPLINT_EXCLUDE += src/node_win32_perfctr_provider.cc
-CPPLINT_EXCLUDE += src/queue.h
-CPPLINT_EXCLUDE += src/tree.h
-CPPLINT_EXCLUDE += src/v8abbr.h
-
-CPPLINT_FILES = $(filter-out $(CPPLINT_EXCLUDE), $(wildcard src/*.cc src/*.h src/*.c tools/icu/*.h tools/icu/*.cc deps/debugger-agent/include/* deps/debugger-agent/src/*))
-
-cpplint:
-	@$(PYTHON) tools/cpplint.py $(CPPLINT_FILES)
-
-lint: jslint cpplint
-
-.PHONY: lint cpplint jslint bench clean docopen docclean doc dist distclean check uninstall install install-includes install-bin all staticlib dynamiclib test test-all test-addons build-addons website-upload pkg blog blogclean tar binary release-only bench-http-simple bench-idle bench-all bench bench-misc bench-array bench-buffer bench-net bench-http bench-fs bench-tls

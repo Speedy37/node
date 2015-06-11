@@ -73,7 +73,7 @@
   'targets': [
     {
       'target_name': 'node',
-      'type': 'executable',
+      'type': 'shared_library',
 
       'dependencies': [
         'node_js2c#host',
@@ -99,7 +99,7 @@
         'src/node_file.cc',
         'src/node_http_parser.cc',
         'src/node_javascript.cc',
-        'src/node_main.cc',
+        # 'src/node_main.cc',
         'src/node_os.cc',
         'src/node_v8.cc',
         'src/node_stat_watcher.cc',
@@ -334,7 +334,7 @@
             'PLATFORM="win32"',
             '_UNICODE=1',
           ],
-          'libraries': [ '-lpsapi.lib' ]
+          'libraries': [ '-lpsapi' ]
         }, { # POSIX
           'defines': [ '__POSIX__' ],
         }],

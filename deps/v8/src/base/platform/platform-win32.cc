@@ -55,13 +55,14 @@ inline void MemoryBarrier() {
 
 #endif  // __MINGW64_VERSION_MAJOR
 
-
+#ifndef __MINGW64_VERSION_MAJOR
 int localtime_s(tm* out_tm, const time_t* time) {
   tm* posix_local_time_struct = localtime(time);
   if (posix_local_time_struct == NULL) return 1;
   *out_tm = *posix_local_time_struct;
   return 0;
 }
+#endif  // __MINGW64_VERSION_MAJOR
 
 
 int fopen_s(FILE** pFile, const char* filename, const char* mode) {
@@ -1201,7 +1202,7 @@ double OS::nan_value() {
 #ifdef _MSC_VER
   return std::numeric_limits<double>::quiet_NaN();
 #else  // _MSC_VER
-  return NAN;
+  return __builtin_nan("");
 #endif  // _MSC_VER
 }
 

@@ -67,14 +67,16 @@
 #include <string.h>
 #include <sys/types.h>
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) || defined(__MINGW32__)
 #include <direct.h>
 #include <io.h>
 #include <process.h>
+#if defined(_MSC_VER)
 #define strcasecmp _stricmp
 #define getpid _getpid
 #define umask _umask
 typedef int mode_t;
+#endif
 #else
 #include <sys/resource.h>  // getrlimit, setrlimit
 #include <unistd.h>  // setuid, getuid
@@ -2555,6 +2557,7 @@ void StopProfilerIdleNotifier(const FunctionCallbackInfo<Value>& args) {
     obj->ForceSet(OneByteString(env->isolate(), str), var, v8::ReadOnly);     \
   } while (0)
 
+static void RunAtStart(const FunctionCallbackInfo<Value>& args);
 
 void SetupProcessObject(Environment* env,
                         int argc,
@@ -2770,6 +2773,8 @@ void SetupProcessObject(Environment* env,
   NODE_SET_METHOD(process, "_setupNextTick", SetupNextTick);
   NODE_SET_METHOD(process, "_setupDomainUse", SetupDomainUse);
 
+  NODE_SET_METHOD(process, "_runAtStart", RunAtStart);
+
   // pre-set _events object for faster emit checks
   process->Set(env->events_string(), Object::New(env->isolate()));
 }
@@ -2790,7 +2795,7 @@ static void SignalExit(int signo) {
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = SIG_DFL;
-  CHECK_EQ(sigaction(signo, &sa, NULL), 0);
+  CHECK_EQ(sigaction(signo, &sa, nullptr), 0);
 #endif
   raise(signo);
 }
@@ -3529,6 +3534,12 @@ void Init(int* argc,
 }
 
 
+struct AtStartCallback {
+  AtStartCallback* next_;
+  void (*cb_)(const FunctionCallbackInfo<Value>& args, void* context);
+  void* context_;
+};
+
 struct AtExitCallback {
   AtExitCallback* next_;
   void (*cb_)(void* arg);
@@ -3536,7 +3547,33 @@ struct AtExitCallback {
 };
 
 static AtExitCallback* at_exit_functions_;
+static AtStartCallback* at_start_functions_;
+static AtStartCallback* at_start_functions_tail_;
 
+static void RunAtStart(const FunctionCallbackInfo<Value>& args) {
+  AtStartCallback* p = at_start_functions_;
+  at_start_functions_ = NULL;
+  at_start_functions_tail_ = NULL;
+
+  while (p) {
+    AtStartCallback* q = p->next_;
+    p->cb_(args, p->context_);
+    delete p;
+    p = q;
+  }
+}
+
+void AtStart(void (*cb)(const FunctionCallbackInfo<Value>& args, void* context), void* context) {
+  AtStartCallback* p = new AtStartCallback;
+  p->cb_ = cb;
+  p->context_ = context;
+  p->next_ = NULL;
+  if(!at_start_functions_)
+    at_start_functions_ = p;
+  if(at_start_functions_tail_)
+    at_start_functions_tail_->next_ = p;
+  at_start_functions_tail_ = p;  
+}
 
 // TODO(bnoordhuis) Turn into per-context event.
 void RunAtExit(Environment* env) {
@@ -3550,7 +3587,6 @@ void RunAtExit(Environment* env) {
     p = q;
   }
 }
-
 
 void AtExit(void (*cb)(void* arg), void* arg) {
   AtExitCallback* p = new AtExitCallback;
