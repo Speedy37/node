@@ -73,7 +73,7 @@
   'targets': [
     {
       'target_name': 'node',
-      'type': 'executable',
+      'type': 'static_library',
 
       'dependencies': [
         'node_js2c#host',
@@ -99,7 +99,6 @@
         'src/node_file.cc',
         'src/node_http_parser.cc',
         'src/node_javascript.cc',
-        'src/node_main.cc',
         'src/node_os.cc',
         'src/node_v8.cc',
         'src/node_stat_watcher.cc',
@@ -204,21 +203,7 @@
 
                 # For tests
                 './deps/openssl/openssl.gyp:openssl-cli',
-              ],
-              # Do not let unused OpenSSL symbols to slip away
-              'xcode_settings': {
-                'OTHER_LDFLAGS': [
-                  '-Wl,-force_load,<(PRODUCT_DIR)/libopenssl.a',
-                ],
-              },
-              'conditions': [
-                ['OS in "linux freebsd"', {
-                  'ldflags': [
-                    '-Wl,--whole-archive <(PRODUCT_DIR)/libopenssl.a -Wl,--no-whole-archive',
-                  ],
-                }],
-              ],
-            }]]
+              ],            }]]
         }, {
           'defines': [ 'HAVE_OPENSSL=0' ]
         }],
@@ -294,11 +279,6 @@
         } ],
         [ 'v8_postmortem_support=="true"', {
           'dependencies': [ 'deps/v8/tools/gyp/v8.gyp:postmortem-metadata' ],
-          'xcode_settings': {
-            'OTHER_LDFLAGS': [
-              '-Wl,-force_load,<(V8_BASE)',
-            ],
-          },
         }],
         [ 'node_shared_v8=="false"', {
           'sources': [
@@ -369,13 +349,7 @@
             # rather than gyp's preferred "solaris"
             'PLATFORM="sunos"',
           ],
-        }],
-        [
-          'OS in "linux freebsd" and node_shared_v8=="false"', {
-            'ldflags': [
-              '-Wl,--whole-archive <(V8_BASE) -Wl,--no-whole-archive',
-            ],
-        }],
+        }]
       ],
       'msvs_settings': {
         'VCManifestTool': {

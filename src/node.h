@@ -29,7 +29,7 @@
 #   define NODE_EXTERN __declspec(dllimport)
 # endif
 #else
-# define NODE_EXTERN /* nothing */
+#define NODE_EXTERN /* nothing */
 #endif
 
 #ifdef BUILDING_NODE_EXTENSION
@@ -441,6 +441,7 @@ extern "C" NODE_EXTERN void node_module_register(void* mod);
  * Callbacks are run in reverse order of registration, i.e. newest first.
  */
 NODE_EXTERN void AtExit(void (*cb)(void* arg), void* arg = 0);
+NODE_EXTERN void AtStart(void (*cb)(const v8::FunctionCallbackInfo<v8::Value>& args, void* context), void* context);
 
 }  // namespace node
 

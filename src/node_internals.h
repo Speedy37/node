@@ -83,7 +83,7 @@ v8::Local<v8::Object> AddressToJS(
     const sockaddr* addr,
     v8::Local<v8::Object> info = v8::Handle<v8::Object>());
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(__MINGW32__)
 // emulate snprintf() on windows, _snprintf() doesn't zero-terminate the buffer
 // on overflow...
 #include <stdarg.h>

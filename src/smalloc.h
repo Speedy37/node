@@ -42,7 +42,7 @@ namespace smalloc {
 // mirrors deps/v8/src/objects.h
 static const unsigned int kMaxLength = 0x3fffffff;
 
-NODE_EXTERN typedef void (*FreeCallback)(char* data, void* hint);
+typedef void (*FreeCallback)(char* data, void* hint);
 
 /**
  * Return byte size of external array type.
